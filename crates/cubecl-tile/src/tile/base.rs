@@ -102,7 +102,8 @@ impl Tile {
             TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
                 panic!("Tile::delivery: a resident fragment is not a stage source")
             }
-            TileKind::Procedural(_) | TileKind::Lines(_) => comptime!(Delivery::Procedural),
+            // A procedural tile's values, and a plane's own lines, are written by the units.
+            TileKind::Procedural(_) | TileKind::Lines(_) => comptime!(Delivery::SyncPerUnit),
         }
     }
 
@@ -173,7 +174,7 @@ impl Tile {
     /// The launch's cube size this operand was bound with, `0` when unknown.
     pub(crate) fn units(&self) -> comptime_type!(usize) {
         let fill = self.fill_units();
-        comptime!(fill.count)
+        comptime!(fill.count().unwrap_or(0))
     }
 
     /// The units that share a cooperative fill of this tile ([`FillUnits`]): one plane's for a
@@ -1021,7 +1022,7 @@ impl Tile {
                     d.load_window::<S>(src, DeepLoad::Steps, row)
                 }
                 (TileKind::Memory(d), TileKind::PlaneTile(s)) => s.store_window::<S>(d, &held),
-                (TileKind::Memory(d), TileKind::TmaGmem(s)) => s.load_into::<S>(d),
+                (TileKind::Memory(d), TileKind::TmaGmem(s)) => d.load_box::<S>(s),
                 (TileKind::TmaGmem(d), TileKind::Memory(s)) => d.store_from::<S>(s),
                 (TileKind::Memory(d), TileKind::Memory(s)) => d.load_from::<S>(s, &space),
                 (TileKind::Memory(d), TileKind::Procedural(s)) => d.fill_procedural::<S>(s, &space),
