@@ -186,6 +186,15 @@ pub enum AutotuneLevel {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repetitions_are_nonzero_and_default_to_single_execution() {
+        let config: BenchConfig = toml::from_str("").unwrap();
+        assert_eq!(config.repetitions.get(), 1);
+        let config: BenchConfig = toml::from_str("repetitions = 32").unwrap();
+        assert_eq!(config.repetitions.get(), 32);
+        assert!(toml::from_str::<BenchConfig>("repetitions = 0").is_err());
+    }
+
     /// A config naming the sink `recorder` still writes decisions there.
     #[test]
     fn decisions_are_read_under_recorder_too() {

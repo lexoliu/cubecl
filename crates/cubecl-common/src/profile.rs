@@ -134,3 +134,30 @@ impl ProfileDuration {
         self.future.await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::num::NonZeroU32;
+    use cubecl_environment::future::read_sync;
+
+    #[test]
+    fn averages_a_batch_and_preserves_its_start_and_method() {
+        let start = Instant::now();
+        let duration = ProfileDuration::new_device_time(async move {
+            ProfileTicks::from_start_end(start, start + Duration::from_micros(640))
+        })
+        .per_iteration(NonZeroU32::new(32).unwrap());
+        assert_eq!(duration.timing_method(), TimingMethod::Device);
+        let ticks = read_sync(duration.resolve()).unwrap();
+        assert_eq!(ticks.start_duration_since(start), Duration::ZERO);
+        assert_eq!(ticks.duration(), Duration::from_micros(20));
+    }
+
+    #[test]
+    fn averaging_does_not_turn_a_missing_measurement_into_zero() {
+        let duration = ProfileDuration::new_device_time_maybe(async { None })
+            .per_iteration(NonZeroU32::new(32).unwrap());
+        assert!(read_sync(duration.resolve()).is_none());
+    }
+}
