@@ -107,6 +107,20 @@ impl ProfileDuration {
         Self::new(Box::pin(future), TimingMethod::Device)
     }
 
+    /// Average a measured batch without inventing a duration for an unmeasured window.
+    pub fn per_iteration(self, repetitions: core::num::NonZeroU32) -> Self {
+        let method = self.method;
+        Self::new(
+            Box::pin(async move {
+                self.resolve().await.map(|ticks| ProfileTicks {
+                    start: ticks.start,
+                    end: ticks.start + ticks.duration() / repetitions.get(),
+                })
+            }),
+            method,
+        )
+    }
+
     /// Retrieve the future that resolves the profile.
     pub fn into_future(self) -> DynFut<Option<ProfileTicks>> {
         self.future

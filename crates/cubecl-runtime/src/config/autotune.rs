@@ -47,6 +47,10 @@ pub struct AutotuneConfig {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BenchConfig {
+    /// Executions in each measured window, averaged into one operation duration.
+    /// Increase this for timers whose resolution is coarser than a single launch.
+    pub repetitions: core::num::NonZeroU32,
+
     /// Samples every surviving candidate gets before any elimination happens.
     ///
     /// Adaptive only: the fixed-count pass eliminates nothing, so every candidate gets
@@ -84,6 +88,7 @@ pub struct BenchConfig {
 impl Default for BenchConfig {
     fn default() -> Self {
         Self {
+            repetitions: core::num::NonZeroU32::MIN,
             min_samples: 3,
             max_samples: 10,
             short_circuit_samples: 2,
