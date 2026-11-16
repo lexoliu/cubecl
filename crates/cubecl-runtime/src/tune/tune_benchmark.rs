@@ -82,10 +82,22 @@ impl<F: TuneInputs, Out: AutotuneOutput> TuneFn<F, Out> {
             );
         }
         // The output is returned so dead code elimination can't drop the work being profiled.
-        let profiled = client.profile(move || self.execute(inputs), &self.name);
+        let repetitions = crate::config::CubeClRuntimeConfig::get()
+            .autotune
+            .bench
+            .repetitions;
+        let profiled = client.profile(
+            move || {
+                for _ in 1..repetitions.get() {
+                    self.execute(inputs.clone())?;
+                }
+                self.execute(inputs)
+            },
+            &self.name,
+        );
 
         match profiled {
-            Ok((Ok(_), duration)) => Ok(duration),
+            Ok((Ok(_), duration)) => Ok(duration.per_iteration(repetitions)),
             Ok((Err(err), _)) => Err(err),
             Err(err) => Err(AutotuneError::Unknown {
                 name: self.name.to_string(),

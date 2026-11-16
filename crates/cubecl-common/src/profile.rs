@@ -107,6 +107,20 @@ impl ProfileDuration {
         Self::new(Box::pin(future), TimingMethod::Device)
     }
 
+    /// Average a measured batch without inventing a duration for an unmeasured window.
+    pub fn per_iteration(self, repetitions: core::num::NonZeroU32) -> Self {
+        let method = self.method;
+        Self::new(
+            Box::pin(async move {
+                self.resolve().await.map(|ticks| ProfileTicks {
+                    start: ticks.start,
+                    end: ticks.start + ticks.duration() / repetitions.get(),
+                })
+            }),
+            method,
+        )
+    }
+
     /// Retrieve the future that resolves the profile.
     pub fn into_future(self) -> DynFut<Option<ProfileTicks>> {
         self.future
@@ -118,5 +132,32 @@ impl ProfileDuration {
     /// why that is not reported as a zero duration.
     pub async fn resolve(self) -> Option<ProfileTicks> {
         self.future.await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::num::NonZeroU32;
+    use cubecl_environment::future::block_on;
+
+    #[test]
+    fn averages_a_batch_and_preserves_its_start_and_method() {
+        let start = Instant::now();
+        let duration = ProfileDuration::new_device_time(async move {
+            ProfileTicks::from_start_end(start, start + Duration::from_micros(640))
+        })
+        .per_iteration(NonZeroU32::new(32).unwrap());
+        assert_eq!(duration.timing_method(), TimingMethod::Device);
+        let ticks = block_on(duration.resolve()).unwrap();
+        assert_eq!(ticks.start_duration_since(start), Duration::ZERO);
+        assert_eq!(ticks.duration(), Duration::from_micros(20));
+    }
+
+    #[test]
+    fn averaging_does_not_turn_a_missing_measurement_into_zero() {
+        let duration = ProfileDuration::new_device_time_maybe(async { None })
+            .per_iteration(NonZeroU32::new(32).unwrap());
+        assert!(block_on(duration.resolve()).is_none());
     }
 }
