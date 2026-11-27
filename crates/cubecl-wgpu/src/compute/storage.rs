@@ -8,7 +8,7 @@ use wgpu::BufferUsages;
 /// Minimum buffer size in bytes. The WebGPU spec requires buffer sizes > 0, and shaders
 /// declare typed arrays (e.g. `array<vec4<f32>>`) that impose a minimum binding size.
 /// 32 bytes covers the largest possible binding type (`vec4<f64>`).
-const MIN_BUFFER_SIZE: u64 = 32;
+pub(crate) const MIN_BUFFER_SIZE: u64 = 32;
 
 /// Buffer storage for wgpu.
 pub struct WgpuStorage {
@@ -100,6 +100,19 @@ impl WgpuResource {
         };
         wgpu::BindingResource::Buffer(binding)
     }
+
+    /// Return a dynamic-offset binding view anchored at offset 0 of the backing
+    /// buffer; the slice's [`Self::offset`] is supplied at `set_bind_group`.
+    pub(crate) fn as_wgpu_dynamic_bind_resource(&self) -> wgpu::BindingResource<'_> {
+        let size = NonZeroU64::new(self.size.next_multiple_of(4));
+
+        let binding = wgpu::BufferBinding {
+            buffer: &self.buffer,
+            offset: 0,
+            size,
+        };
+        wgpu::BindingResource::Buffer(binding)
+    }
 }
 
 /// Keeps actual wgpu buffer references in a hashmap with ids as key.
@@ -126,6 +139,15 @@ impl WgpuStorage {
 
     pub(crate) fn contains(&self, id: StorageId) -> bool {
         self.memory.contains_key(&id)
+    }
+
+    pub(crate) fn get_at(&self, id: StorageId, offset: u64, size: u64) -> Option<WgpuResource> {
+        let memory = self.memory.get(&id)?;
+        Some(WgpuResource {
+            host_ptr: memory.host_ptr,
+            storage_id: Some(id),
+            ..WgpuResource::new(memory.buffer.clone(), memory.address, offset, size)
+        })
     }
 
     pub(crate) fn take_released_ids(&mut self) -> alloc::vec::Vec<StorageId> {
