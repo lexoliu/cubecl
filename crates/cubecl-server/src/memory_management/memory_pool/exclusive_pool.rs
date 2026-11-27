@@ -133,9 +133,15 @@ impl ExclusiveMemoryPool {
         storage: &mut Storage,
         size: u64,
     ) -> Result<(usize, &mut MemoryPage), IoError> {
-        let alloc_size = (self.cur_avg_size as u64)
-            .max(size)
-            .next_multiple_of(self.alignment);
+        // Small buckets (<= 32 KiB) allocate at `max_alloc_size` so any request
+        // in the bucket can reuse any free page instead of fragmenting across
+        // dozens of narrow sizes.
+        let alloc_size = if self.max_alloc_size <= 32 * 1024 {
+            self.max_alloc_size
+        } else {
+            (self.cur_avg_size as u64).max(size)
+        }
+        .next_multiple_of(self.alignment);
 
         let storage = storage.alloc(alloc_size)?;
 
@@ -150,9 +156,7 @@ impl ExclusiveMemoryPool {
         self.pages.push(MemoryPage {
             slice,
             alloc_size,
-            // Start the allocation at 'almost ready to free'. Every use will decrement this.
-            // This means allocations start as "suspected as unused" and over time will be kept for longer.
-            free_count: ALLOC_AFTER_FREE - 1,
+            free_count: 0,
         });
         self.pages_peak = self.pages_peak.max(self.pages.len() as u64);
 
@@ -185,7 +189,7 @@ impl MemoryPool for ExclusiveMemoryPool {
             // get a page with a big enough size, so this is ok to do.
             page.slice.storage.utilization = StorageUtilization { offset: 0, size };
             page.slice.padding = padding;
-            page.free_count = page.free_count.saturating_sub(1);
+            page.free_count = 0;
             page.slice.handle.clone()
         });
 

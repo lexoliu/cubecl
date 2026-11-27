@@ -8,11 +8,18 @@ use wgpu::BufferUsages;
 /// Minimum buffer size in bytes. The WebGPU spec requires buffer sizes > 0, and shaders
 /// declare typed arrays (e.g. `array<vec4<f32>>`) that impose a minimum binding size.
 /// 32 bytes covers the largest possible binding type (`vec4<f64>`).
-const MIN_BUFFER_SIZE: u64 = 32;
+pub(crate) const MIN_BUFFER_SIZE: u64 = 32;
 
 /// Buffer storage for wgpu.
 pub struct WgpuStorage {
     memory: HashMap<StorageId, WgpuMemory>,
+    /// Storage IDs removed by [`ComputeStorage::dealloc`] since the stream last
+    /// invalidated cached bind groups referencing them.
+    released_ids: alloc::vec::Vec<StorageId>,
+    /// Buffers removed on wasm whose explicit `GPUBuffer.destroy()` is deferred
+    /// until the stream's current encoder has been submitted to the queue.
+    #[cfg(target_family = "wasm")]
+    pending_destroy: alloc::vec::Vec<wgpu::Buffer>,
     /// The bytes `memory` holds.
     allocated: u64,
     device: wgpu::Device,
@@ -46,6 +53,10 @@ pub struct WgpuResource {
     /// The buffer host mapping, if host visible.
     #[new(default)]
     pub(crate) host_ptr: Option<HostPtr>,
+    /// Owning storage ID when backed by [`WgpuStorage`], used to key and
+    /// invalidate cached bind groups on buffer deallocation.
+    #[new(default)]
+    pub(crate) storage_id: Option<StorageId>,
     /// The buffer offset.
     pub offset: u64,
     /// The size of the resource.
@@ -89,6 +100,19 @@ impl WgpuResource {
         };
         wgpu::BindingResource::Buffer(binding)
     }
+
+    /// Return a dynamic-offset binding view anchored at offset 0 of the backing
+    /// buffer; the slice's [`Self::offset`] is supplied at `set_bind_group`.
+    pub(crate) fn as_wgpu_dynamic_bind_resource(&self) -> wgpu::BindingResource<'_> {
+        let size = NonZeroU64::new(self.size.next_multiple_of(4));
+
+        let binding = wgpu::BufferBinding {
+            buffer: &self.buffer,
+            offset: 0,
+            size,
+        };
+        wgpu::BindingResource::Buffer(binding)
+    }
 }
 
 /// Keeps actual wgpu buffer references in a hashmap with ids as key.
@@ -102,11 +126,42 @@ impl WgpuStorage {
     ) -> Self {
         Self {
             memory: HashMap::new(),
+            released_ids: alloc::vec::Vec::new(),
+            #[cfg(target_family = "wasm")]
+            pending_destroy: alloc::vec::Vec::new(),
             allocated: 0,
             device,
             buffer_usages: usages,
             mem_alignment,
             vk_storage,
+        }
+    }
+
+    pub(crate) fn contains(&self, id: StorageId) -> bool {
+        self.memory.contains_key(&id)
+    }
+
+    pub(crate) fn get_at(&self, id: StorageId, offset: u64, size: u64) -> Option<WgpuResource> {
+        let memory = self.memory.get(&id)?;
+        Some(WgpuResource {
+            host_ptr: memory.host_ptr,
+            storage_id: Some(id),
+            ..WgpuResource::new(memory.buffer.clone(), memory.address, offset, size)
+        })
+    }
+
+    pub(crate) fn take_released_ids(&mut self) -> alloc::vec::Vec<StorageId> {
+        core::mem::take(&mut self.released_ids)
+    }
+
+    /// Explicitly destroy deallocated WebGPU buffers after their referencing
+    /// command encoder has been submitted. On `wasm32`, `wgpu::Buffer::drop` is
+    /// a no-op, so without `destroy()` freed buffers stay allocated in browser
+    /// GPU memory until JavaScript GC collects their wrappers.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn destroy_pending(&mut self) {
+        for buffer in self.pending_destroy.drain(..) {
+            buffer.destroy();
         }
     }
 }
@@ -128,6 +183,7 @@ impl ComputeStorage for WgpuStorage {
             })?;
         Ok(WgpuResource {
             host_ptr: memory.host_ptr,
+            storage_id: Some(handle.id),
             ..WgpuResource::new(
                 memory.buffer.clone(),
                 memory.address,
@@ -165,6 +221,9 @@ impl ComputeStorage for WgpuStorage {
     fn dealloc(&mut self, id: StorageId) {
         if let Some(memory) = self.memory.remove(&id) {
             self.allocated -= memory.buffer.size();
+            self.released_ids.push(id);
+            #[cfg(target_family = "wasm")]
+            self.pending_destroy.push(memory.buffer);
         }
     }
 

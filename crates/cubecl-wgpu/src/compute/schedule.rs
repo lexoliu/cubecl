@@ -181,12 +181,16 @@ impl ScheduledWgpuBackend {
 
 pub type Addresses = SmallVec<[u64; 8]>;
 
+pub(crate) struct ResolvedResources {
+    pub(crate) resources: Vec<WgpuResource>,
+    pub(crate) custom_resources: Vec<WgpuResource>,
+    pub(crate) addresses: Option<Addresses>,
+    pub(crate) dynamic_offset: Option<u32>,
+}
+
 impl BindingsResource {
     /// Converts metadata and scalar bindings into WGPU resources for a stream.
-    pub fn into_resources(
-        mut self,
-        stream: &mut WgpuStream,
-    ) -> (Vec<WgpuResource>, Vec<WgpuResource>, Option<Addresses>) {
+    pub(crate) fn into_resources(mut self, stream: &mut WgpuStream) -> ResolvedResources {
         let info = (!self.info.data.is_empty())
             .then(|| stream.info_uniform(core::mem::take(&mut self.info.data)));
         match self.compiler_info {
@@ -201,19 +205,48 @@ impl BindingsResource {
                     self.resources.push(info);
                 }
                 match params_transfer {
-                    ParamsTransfer::Immediate => (vec![], self.resources, Some(addresses)),
+                    ParamsTransfer::Immediate => ResolvedResources {
+                        resources: vec![],
+                        custom_resources: self.resources,
+                        addresses: Some(addresses),
+                        dynamic_offset: None,
+                    },
                     ParamsTransfer::Uniform => {
                         let address_buffer =
                             stream.create_uniform(bytemuck::cast_slice(&addresses));
-                        (vec![address_buffer], self.resources, None)
+                        ResolvedResources {
+                            resources: vec![address_buffer],
+                            custom_resources: self.resources,
+                            addresses: None,
+                            dynamic_offset: None,
+                        }
                     }
                 }
             }
-            _ => {
+            CompilerInfo::WGSL | CompilerInfo::Metal => {
+                let dynamic_offset = info.as_ref().map(|res| {
+                    u32::try_from(res.offset).expect("metadata dynamic offset exceeds u32")
+                });
                 if let Some(info) = info {
                     self.resources.push(info);
                 }
-                (self.resources, vec![], None)
+                ResolvedResources {
+                    resources: self.resources,
+                    custom_resources: vec![],
+                    addresses: None,
+                    dynamic_offset,
+                }
+            }
+            CompilerInfo::None => {
+                if let Some(info) = info {
+                    self.resources.push(info);
+                }
+                ResolvedResources {
+                    resources: self.resources,
+                    custom_resources: vec![],
+                    addresses: None,
+                    dynamic_offset: None,
+                }
             }
         }
     }

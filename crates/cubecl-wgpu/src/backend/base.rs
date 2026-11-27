@@ -270,9 +270,17 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             _ => None,
         };
 
+        let has_dynamic_info = match repr {
+            Some(AutoRepresentationRef::Wgsl(_)) => !bindings.info.data.is_empty(),
+            #[cfg(all(feature = "msl", target_os = "macos"))]
+            Some(AutoRepresentationRef::Msl(_)) => !bindings.info.data.is_empty(),
+            _ => false,
+        };
+
         let create = || {
             let layout = bindings_info.map(|(bindings, immediate_size)| {
                 if !bindings.is_empty() {
+                    let last = bindings.len() - 1;
                     let bindings = bindings
                         .into_iter()
                         .map(|visibility| match visibility {
@@ -288,7 +296,7 @@ impl<C: WgpuCompiler> WgpuServer<C> {
                             visibility: ShaderStages::COMPUTE,
                             ty: BindingType::Buffer {
                                 ty,
-                                has_dynamic_offset: false,
+                                has_dynamic_offset: has_dynamic_info && i == last,
                                 min_binding_size: None,
                             },
                             count: None,

@@ -1,4 +1,5 @@
 use super::{
+    bind_group_cache::{BindGroupKey, WgpuBindGroupCache},
     graph::{GraphRecording, ReplayDispatch, ReplayTask, WgpuGraph},
     mem_manager::{self, AuxiliaryMemory},
     poll::WgpuPoll,
@@ -22,7 +23,7 @@ use cubecl_common::{
 use cubecl_core::{
     CubeCount, MemoryConfiguration,
     server::{BufferBinding, DeviceCaptures, IoError, ProfileError, ProfilingToken, ServerError},
-    zspace::Shape,
+    zspace::{Shape, SmallVec},
 };
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::future::{self, DynFut};
@@ -36,7 +37,7 @@ use cubecl_server::memory_management::relocation::{
 use cubecl_server::memory_management::{Cleanup, MemoryManagement};
 use cubecl_server::{
     logging::ServerLogger,
-    memory_management::{ErrorGraph, FailureId, ManagedMemoryHandle, SharedMemoryBindings},
+    memory_management::{ErrorGraph, FailureId, SharedMemoryBindings},
     metadata_cache::{MetadataCachePolicy, MetadataInfoCache},
     stream::{StreamCapture, StreamMemory},
     timestamp_profiler::TimestampProfiler,
@@ -109,12 +110,13 @@ pub struct WgpuStream {
     shared_bindings: SharedMemoryBindings,
     /// Reusable per-launch info uniforms (kernel shapes/strides/scalars), keyed
     /// by the exact info words they were built from — same scheme as the CUDA
-    /// and HIP servers. A hit reuses the already-uploaded uniform buffer, so a
-    /// stable-shape launch costs no uniform reservation and no
-    /// `queue.write_buffer`. The cached [`ManagedMemoryHandle`] keeps the slice
-    /// reserved past the per-flush release in
-    /// [`AuxiliaryMemory::release_uniforms`].
-    pub(crate) info_cache: MetadataInfoCache<(ManagedMemoryHandle, WgpuResource)>,
+    /// and HIP servers. A hit reuses the already-uploaded metadata slice inside
+    /// the stream's dynamic-offset [`InfoPool`](super::info_pool::InfoPool), so
+    /// a stable-shape launch costs no upload and shares its cached bind group.
+    pub(crate) info_cache: MetadataInfoCache<(Arc<()>, WgpuResource)>,
+    /// Reusable pipeline layouts and bind groups for this stream, invalidated
+    /// whenever a backing storage buffer is deallocated.
+    bind_groups: WgpuBindGroupCache,
     /// This stream's position in the graph-capture lifecycle (see
     /// [`StreamCapture`]). Enforces the ordered `graph_prepare` →
     /// `begin_capture` → `end_capture` transitions; while recording, enqueued
@@ -161,11 +163,17 @@ impl RelocatableStream for WgpuStream {
     fn relocate(&mut self, reason: RelocationReason, failures: &mut ErrorGraph) {
         let mut copier = WgpuCopies::new(self.device.clone(), self.queue.clone());
         self.memory.relocate(&mut copier, reason, failures);
+        self.flush_destroyed_buffers();
     }
 
     fn cleanup_memory(&mut self, failures: &mut ErrorGraph) {
+        // Submit any queued work still referencing buffers before reclaiming and
+        // destroying unused pages.
+        self.submit();
         self.memory.cleanup(Cleanup::Explicit, failures);
         self.auxiliary.cleanup_uniforms();
+        self.bind_groups.clear_entries();
+        self.flush_destroyed_buffers();
     }
 }
 
@@ -240,11 +248,10 @@ impl WgpuStream {
             submission_load: SubmissionLoad::default(),
             pending_write_count,
             shared_bindings: SharedMemoryBindings::default(),
-            // Tighter entry cap than the default policy: the uniforms pool is
-            // bucketed exclusive pages with a 32 KiB minimum, so every cached
-            // entry pins a whole page (512 × 32 KiB ≈ 16 MiB worst case) —
-            // unlike CUDA/HIP where an entry is a small dynamic-pool slice.
-            info_cache: MetadataInfoCache::new(MetadataCachePolicy::new(512, 2048)),
+            // Metadata slices share 512 KiB sub-allocated info pages (~300 B
+            // per entry), so 1,024 entries fit comfortably in one backing buffer.
+            info_cache: MetadataInfoCache::new(MetadataCachePolicy::new(1024, 2048)),
+            bind_groups: WgpuBindGroupCache::default(),
             capturing: StreamCapture::new(captures),
             recording: GraphRecording::default(),
         }
@@ -357,8 +364,15 @@ impl WgpuStream {
                         .shared
                         .bindings
                         .append(&mut shared_inputs.bindings);
-                    let (resources, custom_handles, addresses) = resources.into_resources(self);
-                    self.record_pipeline(pipeline, &resources, &custom_handles, addresses, &count);
+                    let resolved = resources.into_resources(self);
+                    self.record_pipeline(
+                        pipeline,
+                        &resolved.resources,
+                        &resolved.custom_resources,
+                        resolved.addresses,
+                        resolved.dynamic_offset,
+                        &count,
+                    );
                     return;
                 }
                 // Drain into the stream's pending pins; the handle returns its buffer to the
@@ -366,8 +380,15 @@ impl WgpuStream {
                 self.shared_bindings
                     .bindings
                     .append(&mut shared_inputs.bindings);
-                let (resources, custom_handles, addresses) = resources.into_resources(self);
-                self.register_pipeline(pipeline, &resources, &custom_handles, addresses, &count);
+                let resolved = resources.into_resources(self);
+                self.register_pipeline(
+                    pipeline,
+                    &resolved.resources,
+                    &resolved.custom_resources,
+                    resolved.addresses,
+                    resolved.dynamic_offset,
+                    &count,
+                );
             }
         }
     }
@@ -719,14 +740,20 @@ impl WgpuStream {
     pub(crate) fn info_uniform(&mut self, words: Vec<u64>) -> WgpuResource {
         let size = core::mem::size_of_val(words.as_slice());
         if !self.info_cache.should_cache(size) {
-            return self.create_uniform(bytemuck::cast_slice(&words));
-        }
-        if let Some((_handle, resource)) = self.info_cache.get(&words) {
+            let (pin, resource) = self.auxiliary.reserve_info(size as u64);
+            if self.capturing.is_recording() {
+                self.recording.info_pins.push(pin);
+            }
+            self.write_to_buffer(&resource, bytemuck::cast_slice(&words));
             return resource;
         }
-        let (handle, resource) = self.auxiliary.reserve_uniform(size as u64);
+        if let Some((pin, resource)) = self.info_cache.get(&words) {
+            self.auxiliary.pin_queued_info(pin);
+            return resource;
+        }
+        let (pin, resource) = self.auxiliary.reserve_info(size as u64);
         self.write_to_buffer(&resource, bytemuck::cast_slice(&words));
-        self.info_cache.insert(words, (handle, resource.clone()));
+        self.info_cache.insert(words, (pin, resource.clone()));
         resource
     }
 
@@ -876,9 +903,28 @@ impl WgpuStream {
         Ok(())
     }
 
+    fn evict_released_bind_groups(&mut self) {
+        for id in self.memory.storage().take_released_ids() {
+            self.bind_groups.evict_storage(id);
+        }
+        for id in self.auxiliary.take_released_uniform_ids() {
+            self.bind_groups.evict_storage(id);
+        }
+    }
+
+    fn flush_destroyed_buffers(&mut self) {
+        self.evict_released_bind_groups();
+        #[cfg(target_family = "wasm")]
+        if self.tasks_count == 0 {
+            self.memory.storage().destroy_pending();
+            self.auxiliary.destroy_pending_buffers();
+        }
+    }
+
     fn submit_tasks(&mut self) {
         if self.tasks_count == 0 {
             self.shared_bindings.clear();
+            self.flush_destroyed_buffers();
             return;
         }
 
@@ -910,9 +956,13 @@ impl WgpuStream {
         self.submission_load
             .regulate(&self.device, self.tasks_count, index);
 
+        self.tasks_count = 0;
+        self.pending_write_count.store(0, Ordering::Relaxed);
+
         // The main pool's pages are cleaned up by the server before it
         // reserves, and only while no stream records.
         self.auxiliary.release_uniforms();
+        self.flush_destroyed_buffers();
 
         #[cfg(renderdoc)]
         RENDERDOC.with(|renderdoc| {
@@ -922,9 +972,6 @@ impl WgpuStream {
                 renderdoc.start_frame_capture(null(), null());
             }
         });
-
-        self.tasks_count = 0;
-        self.pending_write_count.store(0, Ordering::Relaxed);
     }
 
     /// Drain the driver's validation canary into the log.
@@ -981,6 +1028,7 @@ impl WgpuStream {
         resources: &[WgpuResource],
         custom_resources: &[WgpuResource],
         immediates: Option<Addresses>,
+        dynamic_offset: Option<u32>,
         dispatch: &CubeCount,
     ) {
         // An empty dispatch is a no-op on the normal path; record nothing.
@@ -989,18 +1037,25 @@ impl WgpuStream {
         }
 
         let bind_group = (!resources.is_empty()).then(|| {
-            let entries = resources
+            let last = resources.len() - 1;
+            let entries: SmallVec<[wgpu::BindGroupEntry<'_>; 8]> = resources
                 .iter()
                 .enumerate()
                 .map(|(i, r)| wgpu::BindGroupEntry {
                     binding: i as u32,
-                    resource: r.as_wgpu_bind_resource(),
+                    resource: if dynamic_offset.is_some() && i == last {
+                        r.as_wgpu_dynamic_bind_resource()
+                    } else {
+                        r.as_wgpu_bind_resource()
+                    },
                 })
-                .collect::<Vec<_>>();
-            let group_layout = pipeline.get_bind_group_layout(0);
+                .collect();
+            let group_layout = self
+                .bind_groups
+                .layout_for(&pipeline, || pipeline.get_bind_group_layout(0));
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &group_layout,
+                layout: group_layout,
                 entries: &entries,
             })
         });
@@ -1028,6 +1083,7 @@ impl WgpuStream {
         self.recording.tasks.push(ReplayTask {
             pipeline,
             bind_group,
+            dynamic_offset,
             immediates,
             transitions: custom_resources.to_vec(),
             dispatch,
@@ -1066,7 +1122,8 @@ impl WgpuStream {
                 last_pipeline = Some(&task.pipeline);
             }
             if let Some(bind_group) = &task.bind_group {
-                pass.set_bind_group(0, bind_group, &[]);
+                let offsets = task.dynamic_offset.as_slice();
+                pass.set_bind_group(0, bind_group, offsets);
             }
             if let Some(immediates) = &task.immediates {
                 pass.set_immediates(0, bytemuck::cast_slice(immediates));
@@ -1099,20 +1156,63 @@ impl WgpuStream {
         resources: &[WgpuResource],
         custom_resources: &[WgpuResource],
         addresses: Option<Addresses>,
+        dynamic_offset: Option<u32>,
         dispatch: &CubeCount,
     ) {
         if dispatch.is_empty() {
             return;
         }
 
-        let entries = resources
-            .iter()
-            .enumerate()
-            .map(|(i, r)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: r.as_wgpu_bind_resource(),
-            })
-            .collect::<Vec<_>>();
+        let bind_group = if resources.is_empty() {
+            None
+        } else {
+            self.evict_released_bind_groups();
+            let last = resources.len() - 1;
+            let key = resources
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let id = r.storage_id?;
+                    let owned =
+                        self.memory.storage().contains(id) || self.auxiliary.uniforms_contains(id);
+                    let offset = if dynamic_offset.is_some() && i == last {
+                        0
+                    } else {
+                        r.offset
+                    };
+                    owned.then_some((id, offset, r.size.next_multiple_of(4)))
+                })
+                .collect::<Option<SmallVec<[_; 8]>>>()
+                .map(|bindings| BindGroupKey {
+                    pipeline: WgpuBindGroupCache::pipeline_ptr(&pipeline),
+                    bindings,
+                });
+
+            Some(self.bind_groups.get_or_create(
+                &pipeline,
+                key,
+                || pipeline.get_bind_group_layout(0),
+                |layout| {
+                    let entries: SmallVec<[wgpu::BindGroupEntry<'_>; 8]> = resources
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| wgpu::BindGroupEntry {
+                            binding: i as u32,
+                            resource: if dynamic_offset.is_some() && i == last {
+                                r.as_wgpu_dynamic_bind_resource()
+                            } else {
+                                r.as_wgpu_bind_resource()
+                            },
+                        })
+                        .collect();
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout,
+                        entries: &entries,
+                    })
+                },
+            ))
+        };
 
         let pass = Self::current_pass(
             &mut self.compute_pass,
@@ -1125,15 +1225,9 @@ impl WgpuStream {
 
         pass.set_pipeline(&pipeline);
 
-        if !resources.is_empty() {
-            let group_layout = pipeline.get_bind_group_layout(0);
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &group_layout,
-                entries: &entries,
-            });
-
-            pass.set_bind_group(0, &bind_group, &[]);
+        if let Some(bind_group) = bind_group {
+            let offsets = dynamic_offset.as_slice();
+            pass.set_bind_group(0, &*bind_group, offsets);
         }
 
         if let Some(addresses) = addresses {
