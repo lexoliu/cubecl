@@ -1,4 +1,5 @@
 use super::{
+    bind_group_cache::{BindGroupKey, WgpuBindGroupCache},
     graph::{GraphRecording, ReplayDispatch, ReplayTask, WgpuGraph},
     mem_manager::{self, AuxiliaryMemory},
     poll::WgpuPoll,
@@ -22,7 +23,7 @@ use cubecl_common::{
 use cubecl_core::{
     CubeCount, MemoryConfiguration,
     server::{BufferBinding, DeviceCaptures, IoError, ProfileError, ProfilingToken, ServerError},
-    zspace::Shape,
+    zspace::{Shape, SmallVec},
 };
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::future::{self, DynFut};
@@ -115,6 +116,9 @@ pub struct WgpuStream {
     /// reserved past the per-flush release in
     /// [`AuxiliaryMemory::release_uniforms`].
     pub(crate) info_cache: MetadataInfoCache<(ManagedMemoryHandle, WgpuResource)>,
+    /// Reusable pipeline layouts and bind groups for this stream, invalidated
+    /// whenever a backing storage buffer is deallocated.
+    bind_groups: WgpuBindGroupCache,
     /// This stream's position in the graph-capture lifecycle (see
     /// [`StreamCapture`]). Enforces the ordered `graph_prepare` →
     /// `begin_capture` → `end_capture` transitions; while recording, enqueued
@@ -161,11 +165,17 @@ impl RelocatableStream for WgpuStream {
     fn relocate(&mut self, reason: RelocationReason, failures: &mut ErrorGraph) {
         let mut copier = WgpuCopies::new(self.device.clone(), self.queue.clone());
         self.memory.relocate(&mut copier, reason, failures);
+        self.flush_destroyed_buffers();
     }
 
     fn cleanup_memory(&mut self, failures: &mut ErrorGraph) {
+        // Submit any queued work still referencing buffers before reclaiming and
+        // destroying unused pages.
+        self.submit();
         self.memory.cleanup(Cleanup::Explicit, failures);
         self.auxiliary.cleanup_uniforms();
+        self.bind_groups.clear_entries();
+        self.flush_destroyed_buffers();
     }
 }
 
@@ -245,6 +255,7 @@ impl WgpuStream {
             // entry pins a whole page (512 × 32 KiB ≈ 16 MiB worst case) —
             // unlike CUDA/HIP where an entry is a small dynamic-pool slice.
             info_cache: MetadataInfoCache::new(MetadataCachePolicy::new(512, 2048)),
+            bind_groups: WgpuBindGroupCache::default(),
             capturing: StreamCapture::new(captures),
             recording: GraphRecording::default(),
         }
@@ -876,9 +887,28 @@ impl WgpuStream {
         Ok(())
     }
 
+    fn evict_released_bind_groups(&mut self) {
+        for id in self.memory.storage().take_released_ids() {
+            self.bind_groups.evict_storage(id);
+        }
+        for id in self.auxiliary.take_released_uniform_ids() {
+            self.bind_groups.evict_storage(id);
+        }
+    }
+
+    fn flush_destroyed_buffers(&mut self) {
+        self.evict_released_bind_groups();
+        #[cfg(target_family = "wasm")]
+        if self.tasks_count == 0 {
+            self.memory.storage().destroy_pending();
+            self.auxiliary.destroy_pending_buffers();
+        }
+    }
+
     fn submit_tasks(&mut self) {
         if self.tasks_count == 0 {
             self.shared_bindings.clear();
+            self.flush_destroyed_buffers();
             return;
         }
 
@@ -910,9 +940,13 @@ impl WgpuStream {
         self.submission_load
             .regulate(&self.device, self.tasks_count, index);
 
+        self.tasks_count = 0;
+        self.pending_write_count.store(0, Ordering::Relaxed);
+
         // The main pool's pages are cleaned up by the server before it
         // reserves, and only while no stream records.
         self.auxiliary.release_uniforms();
+        self.flush_destroyed_buffers();
 
         #[cfg(renderdoc)]
         RENDERDOC.with(|renderdoc| {
@@ -922,9 +956,6 @@ impl WgpuStream {
                 renderdoc.start_frame_capture(null(), null());
             }
         });
-
-        self.tasks_count = 0;
-        self.pending_write_count.store(0, Ordering::Relaxed);
     }
 
     /// Drain the driver's validation canary into the log.
@@ -989,18 +1020,20 @@ impl WgpuStream {
         }
 
         let bind_group = (!resources.is_empty()).then(|| {
-            let entries = resources
+            let entries: SmallVec<[wgpu::BindGroupEntry<'_>; 8]> = resources
                 .iter()
                 .enumerate()
                 .map(|(i, r)| wgpu::BindGroupEntry {
                     binding: i as u32,
                     resource: r.as_wgpu_bind_resource(),
                 })
-                .collect::<Vec<_>>();
-            let group_layout = pipeline.get_bind_group_layout(0);
+                .collect();
+            let group_layout = self
+                .bind_groups
+                .layout_for(&pipeline, || pipeline.get_bind_group_layout(0));
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &group_layout,
+                layout: group_layout,
                 entries: &entries,
             })
         });
@@ -1105,14 +1138,45 @@ impl WgpuStream {
             return;
         }
 
-        let entries = resources
-            .iter()
-            .enumerate()
-            .map(|(i, r)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: r.as_wgpu_bind_resource(),
-            })
-            .collect::<Vec<_>>();
+        let bind_group = if resources.is_empty() {
+            None
+        } else {
+            self.evict_released_bind_groups();
+            let key = resources
+                .iter()
+                .map(|r| {
+                    let id = r.storage_id?;
+                    let owned =
+                        self.memory.storage().contains(id) || self.auxiliary.uniforms_contains(id);
+                    owned.then_some((id, r.offset, r.size.next_multiple_of(4)))
+                })
+                .collect::<Option<SmallVec<[_; 8]>>>()
+                .map(|bindings| BindGroupKey {
+                    pipeline: WgpuBindGroupCache::pipeline_ptr(&pipeline),
+                    bindings,
+                });
+
+            Some(self.bind_groups.get_or_create(
+                &pipeline,
+                key,
+                || pipeline.get_bind_group_layout(0),
+                |layout| {
+                    let entries: SmallVec<[wgpu::BindGroupEntry<'_>; 8]> = resources
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| wgpu::BindGroupEntry {
+                            binding: i as u32,
+                            resource: r.as_wgpu_bind_resource(),
+                        })
+                        .collect();
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout,
+                        entries: &entries,
+                    })
+                },
+            ))
+        };
 
         let pass = Self::current_pass(
             &mut self.compute_pass,
@@ -1125,15 +1189,8 @@ impl WgpuStream {
 
         pass.set_pipeline(&pipeline);
 
-        if !resources.is_empty() {
-            let group_layout = pipeline.get_bind_group_layout(0);
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &group_layout,
-                entries: &entries,
-            });
-
-            pass.set_bind_group(0, &bind_group, &[]);
+        if let Some(bind_group) = bind_group {
+            pass.set_bind_group(0, &*bind_group, &[]);
         }
 
         if let Some(addresses) = addresses {
