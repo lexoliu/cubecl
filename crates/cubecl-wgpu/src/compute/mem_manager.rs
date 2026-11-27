@@ -11,7 +11,7 @@ use cubecl_server::{
         AuxiliaryMemoryReport, Cleanup, ErrorGraph, ManagedMemoryBinding, ManagedMemoryHandle,
         MemoryAllocationMode, MemoryHandle, MemoryManagement, MemoryManagementOptions, PageUpdate,
     },
-    storage::ComputeStorage,
+    storage::{ComputeStorage, StorageId},
 };
 use wgpu::BufferUsages;
 
@@ -165,11 +165,27 @@ impl AuxiliaryMemory {
         (retained, resource)
     }
 
-    /// Give back every uniform page nothing uses. The info cache holds
-    /// uniform slices across flushes, so this is where the pages of released
-    /// entries (see `MetadataInfoCache::clear_unpinned`) go back to the driver.
+    /// Give back every uniform and staging page nothing uses. The info cache
+    /// holds uniform slices across flushes, so this is where the pages of
+    /// released entries (see `MetadataInfoCache::clear_unpinned`) go back to
+    /// the driver.
     pub(crate) fn cleanup_uniforms(&mut self) {
         self.uniforms.cleanup(Cleanup::Explicit, &mut self.failures);
+        self.staging.cleanup(Cleanup::Explicit, &mut self.failures);
+    }
+
+    pub(crate) fn uniforms_contains(&mut self, id: StorageId) -> bool {
+        self.uniforms.storage().contains(id)
+    }
+
+    pub(crate) fn take_released_uniform_ids(&mut self) -> alloc::vec::Vec<StorageId> {
+        self.uniforms.storage().take_released_ids()
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn destroy_pending_buffers(&mut self) {
+        self.staging.storage().destroy_pending();
+        self.uniforms.storage().destroy_pending();
     }
 
     /// The queued launches were submitted: their uniforms may be reused.
