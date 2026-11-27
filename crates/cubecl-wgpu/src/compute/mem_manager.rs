@@ -1,7 +1,9 @@
 //! A wgpu stream's memories: the main one every buffer a user allocates lives
 //! in, and the ones the stream keeps for its own reads and launches.
 
+use super::info_pool::InfoPool;
 use crate::{WgpuResource, WgpuStorage};
+use alloc::sync::Arc as AllocArc;
 use cubecl_core::{MemoryConfiguration, server::IoError};
 use cubecl_environment::sync::Arc;
 use cubecl_ir::MemoryDeviceProperties;
@@ -53,6 +55,9 @@ pub(crate) fn main_memory(
 pub struct AuxiliaryMemory {
     staging: MemoryManagement<WgpuStorage>,
     uniforms: MemoryManagement<WgpuStorage>,
+    /// Sub-allocated read-only metadata pages backing kernel `info` bindings
+    /// with dynamic offsets so varying positions/shapes reuse one `GPUBuffer`.
+    info: InfoPool,
     /// The uniforms the queued launches read, released once they are
     /// submitted.
     queued_uniforms: Vec<ManagedMemoryHandle>,
@@ -101,9 +106,20 @@ impl AuxiliaryMemory {
             MemoryManagementOptions::new(UNIFORMS).mode(MemoryAllocationMode::Auto),
         );
 
+        let info = InfoPool::new(
+            WgpuStorage::new(
+                properties.alignment as usize,
+                device.clone(),
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                use_vulkan_compiler,
+            ),
+            properties.alignment,
+        );
+
         Self {
             staging,
             uniforms,
+            info,
             queued_uniforms: Vec::new(),
             failures: ErrorGraph::default(),
         }
@@ -111,7 +127,9 @@ impl AuxiliaryMemory {
 
     /// The bytes these memories hold from the device.
     pub(crate) fn bytes_allocated(&self) -> u64 {
-        self.staging.bytes_allocated() + self.uniforms.bytes_allocated()
+        self.staging.bytes_allocated()
+            + self.uniforms.bytes_allocated()
+            + self.info.bytes_allocated()
     }
 
     /// What each of these memories holds.
@@ -165,31 +183,46 @@ impl AuxiliaryMemory {
         (retained, resource)
     }
 
-    /// Give back every uniform and staging page nothing uses. The info cache
-    /// holds uniform slices across flushes, so this is where the pages of
-    /// released entries (see `MetadataInfoCache::clear_unpinned`) go back to
-    /// the driver.
+    /// Reserve a dynamic-offset slice for kernel `info` metadata.
+    pub(crate) fn reserve_info(&mut self, size: u64) -> (AllocArc<()>, WgpuResource) {
+        self.info.reserve(size)
+    }
+
+    /// Pin an already-cached `info` slice for the current unsubmitted encoder.
+    pub(crate) fn pin_queued_info(&mut self, token: AllocArc<()>) {
+        self.info.pin_queued(token);
+    }
+
+    /// Give back every uniform, metadata, and staging page nothing uses. The
+    /// info cache holds metadata slices across flushes, so this is where the
+    /// pages of released entries (see `MetadataInfoCache::clear_unpinned`) go
+    /// back to the driver.
     pub(crate) fn cleanup_uniforms(&mut self) {
         self.uniforms.cleanup(Cleanup::Explicit, &mut self.failures);
+        self.info.cleanup();
         self.staging.cleanup(Cleanup::Explicit, &mut self.failures);
     }
 
     pub(crate) fn uniforms_contains(&mut self, id: StorageId) -> bool {
-        self.uniforms.storage().contains(id)
+        self.uniforms.storage().contains(id) || self.info.contains(id)
     }
 
     pub(crate) fn take_released_uniform_ids(&mut self) -> alloc::vec::Vec<StorageId> {
-        self.uniforms.storage().take_released_ids()
+        let mut ids = self.uniforms.storage().take_released_ids();
+        ids.extend(self.info.take_released_ids());
+        ids
     }
 
     #[cfg(target_family = "wasm")]
     pub(crate) fn destroy_pending_buffers(&mut self) {
         self.staging.storage().destroy_pending();
         self.uniforms.storage().destroy_pending();
+        self.info.destroy_pending();
     }
 
     /// The queued launches were submitted: their uniforms may be reused.
     pub(crate) fn release_uniforms(&mut self) {
         self.queued_uniforms.clear();
+        self.info.release_queued();
     }
 }

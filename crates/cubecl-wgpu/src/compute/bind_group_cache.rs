@@ -8,7 +8,7 @@ use wgpu::ComputePipeline;
 
 /// Maximum bind groups retained per stream. Covers steady-state model layers
 /// while bounding GPU-process bind-group metadata on browsers (notably `WebKit`).
-pub(crate) const DEFAULT_MAX_BIND_GROUPS: usize = 2048;
+pub(crate) const DEFAULT_MAX_BIND_GROUPS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BindGroupKey {

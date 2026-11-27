@@ -41,6 +41,9 @@ pub struct WgpuGraph {
     /// The uniforms the capture window created (Vulkan address buffers),
     /// held so the uniforms pool cannot reuse them. Dropped with the graph.
     pub(crate) _uniforms: Vec<ManagedMemoryHandle>,
+    /// Uncached metadata slices created inside the capture window, held so the
+    /// info pool cannot reuse them while this graph is live.
+    pub(crate) _info_pins: Vec<Arc<()>>,
     /// Cross-stream input bindings the recorded tasks reference, pinned for
     /// the graph's lifetime instead of until the next submission, which is
     /// where [`WgpuStream::flush`](super::stream::WgpuStream::flush) releases
@@ -61,6 +64,9 @@ pub(crate) struct ReplayTask {
     /// they reference are pinned by the graph. `None` when the kernel binds
     /// no resources (Vulkan immediate-address mode).
     pub(crate) bind_group: Option<wgpu::BindGroup>,
+    /// Dynamic byte offset for the trailing metadata binding, if the pipeline
+    /// uses one.
+    pub(crate) dynamic_offset: Option<u32>,
     /// Vulkan buffer device addresses passed as immediates, resolved once at
     /// record time.
     ///
@@ -99,4 +105,7 @@ pub(crate) struct GraphRecording {
     /// Uniform slices created inside the window, held alive until
     /// `end_capture` hands them to the graph.
     pub(crate) uniform_pins: Vec<ManagedMemoryHandle>,
+    /// Uncached metadata slices created inside the window, held alive until
+    /// `end_capture` hands them to the graph.
+    pub(crate) info_pins: Vec<Arc<()>>,
 }

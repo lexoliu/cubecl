@@ -850,6 +850,7 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
                 tasks: recording.tasks,
                 _guards: guards,
                 _uniforms: recording.uniform_pins,
+                _info_pins: recording.info_pins,
                 _shared: recording.shared,
                 written,
             },
