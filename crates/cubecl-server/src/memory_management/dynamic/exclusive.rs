@@ -19,7 +19,7 @@ const MIN_BUCKET_SIZE: u64 = 1024 * 32;
 /// alignment folds some of them together.
 const MAX_BUCKETS: usize = 24;
 /// The allocations a page waits through, unused, before it is released.
-const BASE_DEALLOC_PERIOD: u64 = 5000;
+const BASE_DEALLOC_PERIOD: u64 = 50_000;
 /// Bytes of page size that add another [`BASE_DEALLOC_PERIOD`] to the wait.
 const DEALLOC_SCALE: u64 = 1024 * 1024 * 1024;
 
